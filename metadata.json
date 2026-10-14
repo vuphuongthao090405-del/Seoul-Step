@@ -1,0 +1,7 @@
+{
+  "name": "SEOUL STEP",
+  "description": "Ứng dụng phân tích, kiểm tra chính tả, ngữ pháp và ngữ cảnh câu tiếng Hàn cho mọi cấp độ từ Sơ cấp đến Cao cấp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
