@@ -89,15 +89,22 @@ export const VerdictBanner: React.FC<VerdictBannerProps> = ({ result, lang, onEd
         {/* Main Case Info */}
         <div className="flex items-start gap-3.5">
           <div className="mt-0.5 shrink-0 p-1 rounded-xl bg-white shadow-2xs">{info.icon}</div>
-          <div>
+          <div className="flex-1">
             <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 mb-1 sm:mb-1.5">
               <span className={`px-3 py-1 rounded-lg text-xs tracking-tight ${info.badgeBg}`}>
                 {info.title}
               </span>
-              <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2 py-0.5 text-xs font-bold text-slate-800 border border-slate-300">
-                <Sparkles className="w-3 h-3 text-[#0f172a]" />
-                {result.aiEngine || "Gemini AI"}
-              </span>
+              {result.isAiPowered === false || result.isFallbackMode ? (
+                <span className="inline-flex items-center gap-1 rounded-lg bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900 border border-amber-300">
+                  <AlertTriangle className="w-3 h-3 text-amber-700" />
+                  {lang === 'vi' ? 'Chế độ dự phòng (Quy tắc ngữ pháp)' : lang === 'ko' ? '기본 규칙 검사 (예비 모드)' : 'Fallback Mode (Rule-based)'}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2 py-0.5 text-xs font-bold text-slate-800 border border-slate-300">
+                  <Sparkles className="w-3 h-3 text-[#0f172a]" />
+                  {result.aiEngine || "Gemini AI"}
+                </span>
+              )}
               {coreCase === 'CASE_3_CONTEXT_UNSUITABLE' && (
                 <span className="px-2.5 py-0.5 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
                   {t.grammarValidBadge}
@@ -107,6 +114,20 @@ export const VerdictBanner: React.FC<VerdictBannerProps> = ({ result, lang, onEd
             <p className="text-xs sm:text-sm font-semibold leading-relaxed max-w-2xl opacity-95">
               {info.desc}
             </p>
+
+            {(result.isAiPowered === false || result.isFallbackMode) && (
+              <div className="mt-2.5 p-2 rounded-xl bg-amber-100/90 border border-amber-300/80 text-amber-950 text-xs flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                <div className="leading-relaxed">
+                  <strong className="font-bold">{lang === 'vi' ? 'Thông báo chế độ dự phòng:' : lang === 'ko' ? '예비 모드 안내:' : 'Fallback Notice:'}</strong>{' '}
+                  {lang === 'vi'
+                    ? 'Do máy chủ AI đang gặp gián đoạn tạm thời (503 Quá tải), hệ thống đang đối chiếu theo bộ quy chuẩn chính tả căn bản và chưa đánh giá toàn diện ngữ cảnh AI. Bạn có thể nhấn thử lại sau giây lát.'
+                    : lang === 'ko'
+                    ? 'AI 서버의 일시적인 혼잡으로 인해 기본 규범 기반 검사 결과가 제공되었습니다. 심층 분석을 위해 잠시 후 다시 시도해 주세요.'
+                    : 'AI models temporarily unavailable (503). Standard spelling and grammar rules were applied. Deep AI contextual analysis requires an active AI connection.'}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

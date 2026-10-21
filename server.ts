@@ -8,20 +8,36 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// Initialize Google GenAI client
-const apiKey = process.env.GEMINI_API_KEY;
-const ai = apiKey
-  ? new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
+// Standard CORS & Preflight handling to prevent 404s on OPTIONS/preflight
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// Initialize Google GenAI client dynamically to support all environment setups
+export function getAiClient(): GoogleGenAI | null {
+  const key =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY;
+  if (!key) return null;
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
       },
-    })
-  : null;
+    },
+  });
+}
 
 // Helper to sanitize & create reliable dictionary search URLs
 function generateDictionaryUrl(source: string, query: string): string {
@@ -46,62 +62,366 @@ interface GeminiCallParams {
   config?: any;
   candidateModels?: string[];
   maxRetriesPerModel?: number;
+  timeoutMs?: number;
 }
 
-// Resilient Gemini invoker with automatic retry on 503/429 and graceful fallback across model tiers
+// Primary stable models for fast, structured linguistic tasks, with ordered failover
+const PRIMARY_MODEL = "gemini-flash-lite-latest";
+const SECONDARY_MODEL = "gemini-3.1-flash-lite";
+const BACKUP_MODEL = "gemini-flash-latest";
+
+const DEFAULT_CANDIDATE_MODELS = [
+  PRIMARY_MODEL,
+  SECONDARY_MODEL,
+  BACKUP_MODEL,
+];
+
+// Permanently disabled / deprecated models (e.g. 404 models)
+const permanentlyDisabledModels = new Set<string>([
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+]);
+
+// Cooldown tracker for rate-limited (429) or temporarily unavailable models
+const cooldownModels = new Map<string, number>();
+
+function isModelAvailable(modelName: string): boolean {
+  if (permanentlyDisabledModels.has(modelName)) return false;
+  const until = cooldownModels.get(modelName);
+  if (!until) return true;
+  if (Date.now() > until) {
+    cooldownModels.delete(modelName);
+    return true;
+  }
+  return false;
+}
+
+function markModelCooldown(modelName: string, durationMs = 2 * 60 * 1000) {
+  cooldownModels.set(modelName, Date.now() + durationMs);
+  console.warn(`[Gemini] Model ${modelName} in temporary cooldown for ${Math.round(durationMs / 1000)}s`);
+}
+
+function markModelPermanentlyDisabled(modelName: string, reason: string) {
+  permanentlyDisabledModels.add(modelName);
+  console.warn(`[Gemini] Model ${modelName} permanently disabled: ${reason}`);
+}
+
+// Safe JSON parser that removes markdown code fences if wrapped
+function parseJsonSafely(text: string): any {
+  if (!text) return null;
+  let cleaned = text.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  }
+  return JSON.parse(cleaned);
+}
+
+interface GeminiCallOutcome {
+  text: string | null;
+  modelName: string;
+  errorStatus: number;
+  errorMessage: string;
+}
+
+// Resilient Gemini invoker: Primary model first, max 1 retry on 503, failover only to single backup, no 404 retries
 async function callGeminiWithFallback(
   aiClient: GoogleGenAI,
   params: GeminiCallParams
-): Promise<{ text: string; modelName: string } | null> {
-  const models = params.candidateModels || [
-    "gemini-flash-latest",
-    "gemini-3.8-flash",
-    "gemini-3.1-flash-lite",
-  ];
-  const maxRetries = params.maxRetriesPerModel ?? 1;
+): Promise<GeminiCallOutcome> {
+  const candidateList = (params.candidateModels || DEFAULT_CANDIDATE_MODELS).filter(
+    (m) => isModelAvailable(m)
+  );
 
-  for (const modelName of models) {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  if (candidateList.length === 0) {
+    candidateList.push(PRIMARY_MODEL);
+  }
+
+  const startTime = Date.now();
+  const TOTAL_BUDGET_MS = 25000;
+  const PER_MODEL_TIMEOUT_MS = params.timeoutMs || 12000;
+
+  let lastStatus = 500;
+  let lastError = "Unable to contact Gemini AI service";
+
+  for (const modelName of candidateList) {
+    const elapsed = Date.now() - startTime;
+    const remainingTime = TOTAL_BUDGET_MS - elapsed;
+    if (remainingTime < 2500) {
+      console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
+      break;
+    }
+
+    const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
+
+    // Max 1 retry for transient 503 errors on the primary model
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) {
+        // Controlled backoff delay on 503
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+
+      let timer: NodeJS.Timeout | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TIMEOUT_${modelName}`)), currentTimeout);
+      });
+
+      const genPromise = aiClient.models.generateContent({
+        model: modelName,
+        contents: params.contents,
+        config: params.config,
+      });
+
+      // Attach catch handler to prevent unhandled rejection if timeout triggers first
+      genPromise.catch(() => {});
+
       try {
-        const resp = await aiClient.models.generateContent({
-          model: modelName,
-          contents: params.contents,
-          config: params.config,
-        });
+        const resp = await Promise.race([genPromise, timeoutPromise]);
+        if (timer) clearTimeout(timer);
 
         if (resp && resp.text) {
-          return { text: resp.text, modelName };
+          return {
+            text: resp.text,
+            modelName,
+            errorStatus: 200,
+            errorMessage: "",
+          };
         }
       } catch (err: any) {
-        const errMsg = String(err?.message || err || "");
-        const isTransientOverload =
-          errMsg.includes("503") ||
-          errMsg.includes("UNAVAILABLE") ||
-          errMsg.includes("high demand") ||
-          errMsg.includes("429") ||
-          errMsg.includes("RESOURCE_EXHAUSTED");
+        if (timer) clearTimeout(timer);
 
-        if (isTransientOverload) {
-          if (attempt < maxRetries) {
-            // Wait briefly with backoff before retry
-            await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
-            continue;
-          }
-          // Gracefully try next model tier
-          break;
+        const status = Number(err?.status || err?.code || 0);
+        const errMsg = String(err?.message || "");
+        lastStatus = status || 500;
+        lastError = errMsg;
+
+        const isTimeout = errMsg.startsWith("TIMEOUT_");
+        const is404 = status === 404 || errMsg.includes("404") || errMsg.includes("is no longer available");
+        const isQuota429 = status === 429 || errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED");
+        const is503 = status === 503 || errMsg.includes("503") || errMsg.includes("high demand") || errMsg.includes("UNAVAILABLE");
+
+        if (is404) {
+          // Never retry a 404 model, permanently disable it
+          markModelPermanentlyDisabled(modelName, errMsg.slice(0, 80));
+          break; // Immediately move to next candidate or stop
         }
 
-        // For other errors, move to next model tier
-        break;
+        if (isQuota429) {
+          markModelCooldown(modelName, 2 * 60 * 1000);
+          console.warn(`[Gemini] Model ${modelName} hit quota (429), failing over`);
+          break; // Move to next candidate
+        }
+
+        if (isTimeout) {
+          console.warn(`[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms`);
+          lastStatus = 504;
+          lastError = `Request to ${modelName} timed out`;
+          break; // Do not retry on timeout
+        }
+
+        if (is503) {
+          console.warn(`[Gemini] 503 High Demand on ${modelName} (attempt ${attempt}/${maxAttempts})`);
+          if (attempt >= maxAttempts) {
+            markModelCooldown(modelName, 30 * 1000);
+            break; // Fail over to backup model
+          }
+          continue; // Retry once
+        }
+
+        console.warn(`[Gemini] Error [${status}] on ${modelName}:`, errMsg.slice(0, 100));
+        break; // Do not retry other errors
       }
     }
   }
 
-  return null;
+  return {
+    text: null,
+    modelName: "",
+    errorStatus: lastStatus || 503,
+    errorMessage: lastError,
+  };
 }
 
-app.post("/api/analyze", async (req, res) => {
+// Clean up any repeated/glitched phrases or duplicate words in Korean sentence
+export function sanitizeKoreanSentence(text: string): string {
+  if (!text || typeof text !== "string") return "";
+  let cleaned = text.trim();
+
+  // Fix specific AI hallucinated duplicate phrases
+  cleaned = cleaned.replace(/그\s*사람의\s+그의/g, "그 사람의");
+  cleaned = cleaned.replace(/그의\s+그\s*사람의/g, "그 사람의");
+  cleaned = cleaned.replace(/그\s*사람의\s+그\s*사람의/g, "그 사람의");
+
+  // Fix general duplicate consecutive identical words (e.g. "저는 저는" -> "저는", "말을 말을" -> "말을")
+  cleaned = cleaned.replace(/\b([가-힣]+)\s+\1\b/g, "$1");
+
+  // Fix accidental punctuation glitches and multiple spaces
+  cleaned = cleaned.replace(/\s+([.,!?~])/g, "$1");
+  cleaned = cleaned.replace(/\s{2,}/g, " ");
+
+  return cleaned.trim();
+}
+
+// Build rock-solid, 100% consistent diff tokens that strictly reconstruct correctedText
+export function buildStrictConsistentDiffTokens(
+  originalText: string,
+  correctedText: string,
+  aiTokens: any[] = [],
+  errorItems: any[] = []
+): Array<{ text: string; type: "normal" | "modified" | "added"; original?: string; note?: string }> {
+  const normOriginal = originalText.trim();
+  const normCorrected = correctedText.trim();
+
+  if (!normCorrected) {
+    return [{ text: normOriginal, type: "normal" }];
+  }
+
+  // If no change, return a single normal token
+  if (normOriginal === normCorrected) {
+    return [{ text: normCorrected, type: "normal" }];
+  }
+
+  const origWords = normOriginal.split(/\s+/).filter(Boolean);
+  const corrWords = normCorrected.split(/\s+/).filter(Boolean);
+
+  // Map AI token notes for quick lookup
+  const aiNoteMap = new Map<string, { original?: string; note?: string }>();
+  if (Array.isArray(aiTokens)) {
+    for (const t of aiTokens) {
+      if (t && t.text && (t.type === "modified" || t.type === "added")) {
+        aiNoteMap.set(t.text.trim(), { original: t.original, note: t.note });
+      }
+    }
+  }
+
+  // Map error items notes
+  const errorMap = new Map<string, { whyWrong?: string; howToFix?: string }>();
+  if (Array.isArray(errorItems)) {
+    for (const e of errorItems) {
+      if (e && e.targetWord) {
+        errorMap.set(e.targetWord.trim(), { whyWrong: e.whyWrong, howToFix: e.howToFix });
+      }
+    }
+  }
+
+  const n = origWords.length;
+  const m = corrWords.length;
+
+  // LCS dynamic programming table
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (origWords[i - 1] === corrWords[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Map each corrWord to matched origWord index if in LCS
+  const corrMatchedOrig: (number | null)[] = new Array(m).fill(null);
+  const origMatchedCorr: (number | null)[] = new Array(n).fill(null);
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (origWords[i - 1] === corrWords[j - 1]) {
+      corrMatchedOrig[j - 1] = i - 1;
+      origMatchedCorr[i - 1] = j - 1;
+      i--;
+      j--;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+
+  const tokens: Array<{ text: string; type: "normal" | "modified" | "added"; original?: string; note?: string }> = [];
+
+  for (let cIdx = 0; cIdx < m; cIdx++) {
+    const word = corrWords[cIdx];
+    const origIdx = corrMatchedOrig[cIdx];
+
+    if (origIdx !== null) {
+      tokens.push({
+        text: word,
+        type: "normal",
+      });
+    } else {
+      // Find what original word was replaced
+      let matchedOrigWord: string | undefined;
+      let note: string | undefined;
+
+      const aiMatch = aiNoteMap.get(word) || Array.from(aiNoteMap.entries()).find(([k]) => word.includes(k) || k.includes(word))?.[1];
+      if (aiMatch) {
+        matchedOrigWord = aiMatch.original;
+        note = aiMatch.note;
+      }
+
+      if (!matchedOrigWord) {
+        const nearestOrig = origWords[Math.min(cIdx, n - 1)];
+        if (nearestOrig && origMatchedCorr[Math.min(cIdx, n - 1)] === null) {
+          matchedOrigWord = nearestOrig;
+        }
+      }
+
+      if (!note && matchedOrigWord) {
+        const errMatch = errorMap.get(matchedOrigWord);
+        if (errMatch?.whyWrong) {
+          note = errMatch.whyWrong;
+        }
+      }
+
+      tokens.push({
+        text: word,
+        type: matchedOrigWord ? "modified" : "added",
+        original: matchedOrigWord,
+        note: note || (matchedOrigWord ? `Điều chỉnh từ "${matchedOrigWord}" để câu chuẩn xác và tự nhiên hơn.` : "Từ bổ sung để câu hoàn chỉnh."),
+      });
+    }
+  }
+
+  // Consolidate consecutive 'normal' tokens for smooth natural display
+  const consolidated: Array<{ text: string; type: "normal" | "modified" | "added"; original?: string; note?: string }> = [];
+  for (const tok of tokens) {
+    if (tok.type === "normal" && consolidated.length > 0 && consolidated[consolidated.length - 1].type === "normal") {
+      consolidated[consolidated.length - 1].text += " " + tok.text;
+    } else {
+      consolidated.push({ ...tok });
+    }
+  }
+
+  return consolidated;
+}
+
+// Define route path variants to support both direct path and Vercel serverless rewrites
+const analyzeRoutes = ["/api/analyze", "/api/analyze/", "/analyze", "/analyze/"];
+const translateRoutes = ["/api/translate", "/api/translate/", "/translate", "/translate/"];
+const ttsRoutes = ["/api/tts", "/api/tts/", "/tts", "/tts/"];
+const aiFollowupRoutes = ["/api/ai-followup", "/api/ai-followup/", "/ai-followup", "/ai-followup/"];
+const translateAnalysisRoutes = ["/api/translate-analysis", "/api/translate-analysis/", "/translate-analysis", "/translate-analysis/"];
+const translateVariationsRoutes = ["/api/translate-variations", "/api/translate-variations/", "/translate-variations", "/translate-variations/"];
+
+// Health check and route verification for /api/analyze (prevents 404 on GET)
+app.get(analyzeRoutes, (req, res) => {
+  const ai = getAiClient();
+  res.json({
+    status: "online",
+    endpoint: "/api/analyze",
+    methods: ["POST"],
+    description: "SEOUL STEP Korean Sentence & Vocabulary Analysis API",
+    aiConfigured: !!ai,
+  });
+});
+
+app.post(analyzeRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const { text, context, style, level, uiLanguage } = req.body;
 
     if (!text || typeof text !== "string" || !text.trim()) {
@@ -138,6 +458,7 @@ Bạn PHẢI phân loại chính xác vào 1 trong 3 trường hợp sau:
   + verdictTitle: "Trường hợp 1: Câu đúng & Phù hợp ngữ cảnh"
   + verdictSummary: Xác nhận câu hoàn toàn chuẩn mực, có thể sử dụng ngay trong ngữ cảnh đã nêu, kèm giải thích ngắn gọn.
   + explanations: Ngắn gọn, súc tích, giải thích vì sao câu tự nhiên và phù hợp.
+  + correctedText: BẮT BUỘC giữ nguyên câu gốc của người dùng (correctedText = originalText), KHÔNG ĐƯỢC TỰ BỊA RA LỖI để sửa!
 
 --- TRƯỜNG HỢP 2 (coreCase = "CASE_2_HAS_ERRORS"): Câu sai về chính tả hoặc ngữ pháp ---
 - Tiêu chí: Câu có lỗi chính tả, sai quy tắc khoảng cách chữ (띄어쓰기), sai chia động/tính từ, sai trợ từ (이/가, 은/는, 을/를, 에/에서...), sai kính ngữ cấu trúc hoặc liên kết câu.
@@ -150,18 +471,38 @@ Bạn PHẢI phân loại chính xác vào 1 trong 3 trường hợp sau:
     2. Giải thích nguyên nhân ngắn gọn (whyWrong: vì sao sai, không viết quá dài dòng)
     3. Sửa câu (howToFix: sửa lại như thế nào)
     4. Ví dụ minh họa / cách dùng đúng (example: câu ví dụ thực tế)
-  + correctedText: Phiên bản chuẩn xác đã được sửa lỗi hoàn chỉnh.
+  + correctedText: Phiên bản chuẩn xác đã được sửa đúng lỗi thực tế, không tự ý thêm từ, lặp từ, xóa thành phần cần thiết hoặc làm thay đổi ý nghĩa gốc.
 
 --- TRƯỜNG HỢP 3 (coreCase = "CASE_3_CONTEXT_UNSUITABLE"): Câu đúng về ngữ pháp nhưng chưa phù hợp với ngữ cảnh ---
 - Tiêu chí: Câu về mặt cấu trúc ngữ pháp KHÔNG HỀ SAI, nhưng chưa phù hợp về mức độ trang trọng (ví dụ: dùng 반말 với người lớn tuổi/sếp, hoặc dùng 해요체 văn nói trong bài thi viết văn TOPIK 쓰기), hoặc từ ngữ dịch máy móc chưa tự nhiên.
 - QUY TẮC CỰC KỲ QUAN TRỌNG:
-  + TUYỆT ĐỐI KHÔNG đánh dấu là "sai ngữ pháp" (isGrammarValid = true).
+  + TUYỆT ĐỐI KHÔNG đánh dấu là "sai ngữ pháp" (isGrammarValid = true, grammar.hasIssues = false).
   + Phải giải thích rõ: Câu đúng về mặt ngữ pháp, nhưng chưa phù hợp về cách dùng, mức độ trang trọng hoặc độ tự nhiên với đối tượng/hoàn cảnh này.
   + Chỉ rõ: Câu gốc này có thể dùng trong trường hợp nào (whenOriginalCanBeUsed)?
   + Vì sao chưa hợp với ngữ cảnh hiện tại (whyUnsuitableForTarget)?
   + verdict: "GRAMMAR_OK_CONTEXT_UNSUITABLE"
   + verdictTitle: "Trường hợp 3: Ngữ pháp đúng • Chưa phù hợp ngữ cảnh"
   + verdictSummary: Giải thích rõ ràng rằng ngữ pháp chuẩn nhưng cần đổi sang văn phong phù hợp với người nghe/ngữ cảnh.
+
+NGUYÊN TẮC BẮT BUỘC VỀ TẠO CÂU HOÀN THIỆN (correctedText):
+1. PHẢI LÀ MỘT CÂU TIẾNG HÀN HOÀN CHỈNH, MẠCH LẠC, ĐÚNG NGỮ PHÁP, TỰ NHIÊN:
+   - TUYỆT ĐỐI KHÔNG ghép luộm thuộm các mảnh câu từ bản gốc với từ mới khiến câu bị lặp từ kỳ quặc (Ví dụ: TUYỆT ĐỐI KHÔNG tạo ra câu có lỗi lặp từ như "그 사람의 그의 말을...", "저는 저는...", "말을 말을...").
+   - Giữ nguyên cấu trúc tự nhiên của câu tiếng Hàn, không tự ý thêm bớt các đại từ hoặc từ ngữ thừa thãi.
+2. PHÂN BIỆT RÕ LỖI THỰC SỰ VÀ GỢI Ý CẢI THIỆN:
+   - Nếu câu gốc ĐÚNG NGỮ PHÁP VÀ TỰ NHIÊN: Xác nhận câu đúng, giữ nguyên câu gốc.
+   - Nếu câu gốc đúng ngữ pháp nhưng có cách nói tự nhiên hơn: Chỉ đưa ra gợi ý cải thiện (ví dụ: dùng phó từ tự nhiên hơn như '매우' hoặc cách nói '기분이 좋아졌어요'), và giải thích rõ đây là GỢI Ý TRAU CHUỐT TỰ NHIÊN, KHÔNG PHẢI LỖI BẮT BUỘC. TUYỆT ĐỐI KHÔNG coi việc đổi từ đồng nghĩa, đổi phó từ hay điều chỉnh độ tự nhiên là "lỗi sai ngữ pháp".
+   - Nếu câu sai thực sự: Phải sửa đúng lỗi thực tế (sai chính tả, sai 띄어쓰기, sai chia đuôi hoặc sai trợ từ), giải thích chính xác nguyên nhân, không tự ý xóa thành phần cần thiết hay làm đổi lệch ý nghĩa câu gốc.
+   - Khi chuyển sang văn viết (문어체) cho câu như "저는 그 사람의 말을 듣고 기분이 아주 행복해졌어요.":
+     Câu văn viết chuẩn có thể là: "저는 그 사람의 말을 듣고 매우 행복해졌다." hoặc "그 사람의 말을 듣고 매우 행복해졌다."
+     TUYỆT ĐỐI KHÔNG ghép luộm thuộm thành "그 사람의 그의 말을 듣고..."!
+
+NGUYÊN TẮC BẮT BUỘC VỀ DIFF TOKENS (diffTokens):
+- diffTokens phải phản ánh chính xác các thành phần của CHÍNH CÂU HOÀN THIỆN (correctedText).
+- Khi ghép các token trong diffTokens lại với nhau, kết quả PHẢI TRÙNG KHỚP HOÀN TOÀN với correctedText.
+- Mỗi token trong diffTokens:
+  + text: Từ/cụm từ nằm trong correctedText.
+  + type: 'normal' nếu giữ nguyên từ câu gốc; 'modified' nếu là từ được sửa đổi hoặc trau chuốt từ câu gốc (kèm original và note); 'added' nếu là từ mới thêm vào.
+- TUYỆT ĐỐI KHÔNG đưa từ bị xóa làm token độc lập chen vào giữa câu hoàn thiện. Không để câu hiển thị, phần giải thích và nội dung phát âm bị lệch nhau.
 
 YÊU CẦU VỀ AI INSIGHTS (aiInsights):
 - modelAssessment: Nhận định chuyên sâu của AI về tư duy đặt câu và diễn đạt của người học.
@@ -174,7 +515,7 @@ YÊU CẦU VỀ AI INSIGHTS (aiInsights):
   3. Trang trọng / Kính cẩn (하십시오체 hoặc văn viết học thuật)
 
 YÊU CẦU ĐẶC BIỆT VỀ ĐỀ XUẤT CÂU THEO CẤP ĐỘ (suggestions):
-Bạn PHẢI tạo ra từ 4 đến 6 cách diễn đạt ĐA DẠNG CÙNG NGHĨA trải dài qua cả 3 trình độ:
+Bạn PHẢI tạo ra chính xác 3 đến 4 cách diễn đạt ĐA DẠNG CÙNG NGHĨA đại diện cho cả 3 trình độ:
 1. Sơ cấp (level = "beginner"):
    - Từ vựng: Từ vựng cơ bản, thông dụng hàng ngày (단순 기초 어휘).
    - Ngữ pháp: Cấu trúc câu đơn giản, đuôi câu thân thiện chuẩn mực (-아/어요, -았/었어요, liên từ -고, -어서).
@@ -223,12 +564,7 @@ YÊU CẦU CỰC KỲ KHẮT KHE VỀ DỊCH NGHĨA (translation và suggestions
 - Khi dịch sang tiếng Việt: Sử dụng đại từ nhân xưng và kính ngữ tiếng Việt tự nhiên (anh/chị, em, bạn, quý khách...), tránh dịch thô cứng.
 - Khi dịch sang tiếng Anh: Dùng câu tiếng Anh chuẩn mực, lưu loát, tự nhiên.
 
-YÊU CẦU VỀ DIFF TOKENS (diffTokens):
-- Đánh dấu chính xác từng mẩu chữ:
-  + 'normal': phần chữ không thay đổi
-  + 'modified': phần chữ được sửa đổi (kèm original và note giải thích ngắn)
-  + 'added': phần chữ được thêm vào
-  + 'removed': phần chữ thừa bị xóa đi`;
+QUY TẮC PHẢN HỒI: Viết tất cả giải thích, nhận xét sư phạm, lý do và phân tích ngắn gọn, súc tích (1-2 câu trực tiếp), chuẩn xác, tránh viết dài dòng lê thê để trả về kết quả nhanh chóng.`;
 
     const userPrompt = `Dữ liệu phân tích:
 - Nội dung tiếng Hàn: "${trimmedText}"
@@ -239,9 +575,14 @@ YÊU CẦU VỀ DIFF TOKENS (diffTokens):
 Hãy phân tích toàn diện bằng AI và trả về JSON chuẩn theo schema.`;
 
     if (!ai) {
-      // Offline fallback rule-based analyzer when no GEMINI_API_KEY is configured
-      const fallbackResult = generateOfflineAnalysis(trimmedText, context, style, level, uiLanguage);
-      res.json(fallbackResult);
+      res.status(503).json({
+        error:
+          uiLanguage === "ko"
+            ? "Gemini API 키가 서버에 설정되지 않았습니다. Vercel 환경 변수에 GEMINI_API_KEY를 등록해 주세요."
+            : uiLanguage === "en"
+            ? "Gemini API key is not configured on the server. Please set GEMINI_API_KEY."
+            : "Chưa cấu hình GEMINI_API_KEY trên máy chủ. Vui lòng thêm biến môi trường GEMINI_API_KEY.",
+      });
       return;
     }
 
@@ -445,8 +786,8 @@ Hãy phân tích toàn diện bằng AI và trả về JSON chuẩn theo schema.
       ],
     };
 
-    // Cascade models to ensure high availability: gemini-flash-latest -> gemini-3.8-flash -> gemini-3.1-flash-lite
-    const geminiResult = await callGeminiWithFallback(ai, {
+    // Single primary model with intelligent 503 retry and single backup
+    const outcome = await callGeminiWithFallback(ai, {
       contents: userPrompt,
       config: {
         systemInstruction: systemPrompt,
@@ -456,19 +797,120 @@ Hãy phân tích toàn diện bằng AI và trả về JSON chuẩn theo schema.
       },
     });
 
-    if (!geminiResult || !geminiResult.text) {
-      throw new Error("Tất cả các mô hình AI đều tạm thời bận.");
+    if (!outcome.text) {
+      const isTimeout = outcome.errorStatus === 504;
+      const isQuota = outcome.errorStatus === 429;
+      const is503 = outcome.errorStatus === 503;
+
+      let clientMessage = "";
+      if (uiLanguage === "ko") {
+        clientMessage = isQuota
+          ? "AI API 할당량(429)이 일시적으로 초과되었습니다. 1~2분 후 다시 시도해 주세요."
+          : isTimeout
+          ? "AI 요청 시간이 초과되었습니다 (504). 잠시 후 다시 시도해 주세요."
+          : is503
+          ? "AI 서비스가 일시적으로 지연되고 있습니다 (503). 잠시 후 다시 시도해 주세요."
+          : "AI 서비스 응답에 실패했습니다. 잠시 후 다시 시도해 주세요.";
+      } else if (uiLanguage === "en") {
+        clientMessage = isQuota
+          ? "AI API quota limit (429) exceeded. Please wait 1-2 minutes and try again."
+          : isTimeout
+          ? "AI request timed out (504). Please try again in a moment."
+          : is503
+          ? "AI service is currently busy (503). Please try again in a moment."
+          : "AI service request failed. Please try again in a moment.";
+      } else {
+        clientMessage = isQuota
+          ? "Hạn mức API AI (429) hiện đang tạm thời vượt quá. Vui lòng chờ 1-2 phút rồi thử lại."
+          : isTimeout
+          ? "Yêu cầu AI quá thời gian phản hồi (504). Vui lòng thử lại sau giây lát."
+          : is503
+          ? "Hệ thống AI đang chịu tải cao (503 High Demand). Vui lòng thử lại sau vài giây."
+          : "Hệ thống AI tạm thời không thể phản hồi. Vui lòng thử lại sau giây lát.";
+      }
+
+      res.status(outcome.errorStatus || 503).json({
+        error: clientMessage,
+        statusCode: outcome.errorStatus || 503,
+      });
+      return;
     }
 
-    const responseText = geminiResult.text;
-    const chosenModel = geminiResult.modelName;
-    const engineDisplayName = chosenModel.includes("3.8")
-      ? "Gemini 3.8 Flash"
-      : chosenModel.includes("lite")
-      ? "Gemini 3.1 Flash Lite"
-      : "Gemini Flash";
+    const responseText = outcome.text;
+    const chosenModel = outcome.modelName;
+    const engineDisplayName = chosenModel.includes("flash-lite")
+      ? "Gemini Flash Lite"
+      : chosenModel.includes("3.1-flash")
+      ? "Gemini 3.1 Flash"
+      : chosenModel.includes("flash-latest")
+      ? "Gemini Flash"
+      : "Gemini AI";
 
-    const parsed = JSON.parse(responseText);
+    let parsed: any;
+    try {
+      parsed = parseJsonSafely(responseText);
+    } catch (parseErr) {
+      console.warn("Analysis response parse error:", parseErr);
+      res.status(500).json({
+        error:
+          uiLanguage === "ko"
+            ? "AI 분석 결과를 처리하지 못했습니다. 다시 시도해 주세요."
+            : uiLanguage === "en"
+            ? "Could not parse AI response. Please try again."
+            : "Không thể xử lý định dạng kết quả từ AI. Vui lòng thử lại.",
+      });
+      return;
+    }
+
+    // 1. Sanitize correctedText to eliminate any repeated words or machine-concatenation errors
+    let cleanCorrectedText = sanitizeKoreanSentence(parsed.correctedText || trimmedText);
+
+    // If case is CASE_1_CORRECT and AI accidentally changed the text or didn't intend to, verify:
+    if (parsed.coreCase === "CASE_1_CORRECT" || parsed.verdict === "CORRECT") {
+      if (parsed.verdict === "CORRECT" && (!parsed.explanations?.grammar?.hasIssues && !parsed.explanations?.spelling?.hasIssues)) {
+        cleanCorrectedText = trimmedText;
+      }
+    }
+
+    // 2. Ensure consistency in coreCase and explanations:
+    if (parsed.coreCase === "CASE_1_CORRECT" || parsed.verdict === "CORRECT") {
+      if (parsed.explanations?.grammar) {
+        parsed.explanations.grammar.hasIssues = false;
+        parsed.explanations.grammar.errorItems = [];
+      }
+      if (parsed.explanations?.spelling) {
+        parsed.explanations.spelling.hasIssues = false;
+        parsed.explanations.spelling.errorItems = [];
+      }
+    } else if (parsed.coreCase === "CASE_3_CONTEXT_UNSUITABLE" || parsed.verdict === "GRAMMAR_OK_CONTEXT_UNSUITABLE") {
+      // Style / register adaptation is NOT a grammar error
+      if (parsed.explanations?.grammar) {
+        parsed.explanations.grammar.hasIssues = false;
+        parsed.explanations.grammar.errorItems = [];
+        parsed.explanations.grammar.explanation =
+          uiLanguage === "ko"
+            ? "문장의 문법 구조와 조사 결합은 올바릅니다."
+            : uiLanguage === "en"
+            ? "Sentence grammar structure and particle usage are structurally sound."
+            : "Cấu trúc ngữ pháp và trợ từ hoàn toàn chính xác về mặt cú pháp. Không có lỗi ngữ pháp sai.";
+      }
+      if (parsed.explanations?.context) {
+        parsed.explanations.context.isGrammarValid = true;
+      }
+    }
+
+    // 3. Build rock-solid, 100% consistent diff tokens aligned strictly with cleanCorrectedText
+    const allAiErrorItems = [
+      ...(parsed.explanations?.spelling?.errorItems || []),
+      ...(parsed.explanations?.grammar?.errorItems || []),
+      ...(parsed.explanations?.wordUsage?.errorItems || []),
+    ];
+    const consistentDiffTokens = buildStrictConsistentDiffTokens(
+      trimmedText,
+      cleanCorrectedText,
+      parsed.diffTokens,
+      allAiErrorItems
+    );
 
     // Ensure references have valid, authentic URLs
     const sanitizedReferences = (parsed.references || []).map((ref: any) => {
@@ -503,6 +945,8 @@ Hãy phân tích toàn diện bằng AI và trả về JSON chuẩn theo schema.
       isAiPowered: true,
       aiEngine: engineDisplayName,
       ...parsed,
+      correctedText: cleanCorrectedText,
+      diffTokens: consistentDiffTokens,
       aiInsights: parsed.aiInsights ? {
         engine: engineDisplayName,
         modelAssessment: parsed.aiInsights.modelAssessment || "Cấu trúc diễn đạt phản ánh tốt ý định của người học.",
@@ -539,22 +983,22 @@ Hãy phân tích toàn diện bằng AI và trả về JSON chuẩn theo schema.
     res.json(result);
   } catch (error: any) {
     console.error("Analysis error:", error);
-    // Fallback gracefully so the user experience is resilient
-    try {
-      const { text, context, style, level, uiLanguage } = req.body;
-      const fallback = generateOfflineAnalysis(text, context, style, level, uiLanguage);
-      res.json(fallback);
-    } catch {
-      res.status(500).json({
-        error: "Không thể xử lý yêu cầu phân tích vào lúc này. Vui lòng thử lại sau.",
-      });
-    }
+    const uiLang = req.body?.uiLanguage || "vi";
+    res.status(500).json({
+      error:
+        uiLang === "ko"
+          ? "문장 분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+          : uiLang === "en"
+          ? "An error occurred while analyzing the sentence. Please try again."
+          : "Đã xảy ra lỗi trong quá trình phân tích câu. Vui lòng thử lại sau.",
+    });
   }
 });
 
 // AI Endpoint: High-fidelity Native Korean Text-to-Speech
-app.post("/api/tts", async (req, res) => {
+app.post(ttsRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const { text } = req.body;
     if (!text || typeof text !== "string" || !text.trim()) {
       res.status(400).json({ error: "Missing text" });
@@ -606,8 +1050,9 @@ app.post("/api/tts", async (req, res) => {
 });
 
 // Endpoint cho phép hỏi đáp tương tác trực tiếp với AI về câu đang phân tích
-app.post("/api/ai-followup", async (req, res) => {
+app.post(aiFollowupRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const { sentence, question, uiLanguage = "vi" } = req.body;
     if (!sentence || !question) {
       res.status(400).json({ error: "Missing sentence or question" });
@@ -632,14 +1077,14 @@ Nếu có đưa ra câu biến thể, hãy ghi rõ:
       return;
     }
 
-    const geminiResult = await callGeminiWithFallback(ai, {
+    const outcome = await callGeminiWithFallback(ai, {
       contents: prompt,
       config: {
         temperature: 0.3,
       },
     });
 
-    const answerText = geminiResult?.text ||
+    const answerText = outcome.text ||
       `[AI Phản hồi]: Với câu "${sentence}", bạn có thể áp dụng linh hoạt tùy theo mức độ thân mật với đối phương. Ví dụ: Dùng dạng 존댓말 (-아요/어요) khi nói chuyện lịch sự và 반말 khi nói với bạn bè thân.`;
 
     res.json({ answer: answerText });
@@ -650,8 +1095,9 @@ Nếu có đưa ra câu biến thể, hãy ghi rõ:
 });
 
 // AI Endpoint: Seamless translation of entire analysis results when user switches language
-app.post("/api/translate-analysis", async (req, res) => {
+app.post(translateAnalysisRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const { analysis, targetLanguage } = req.body;
     if (!analysis || !targetLanguage) {
       res.status(400).json({ error: "Thiếu dữ liệu phân tích hoặc ngôn ngữ đích." });
@@ -707,7 +1153,7 @@ CÁC NGUYÊN TẮC BẮT BUỘC:
 
 3. Giữ nguyên cấu trúc JSON y hệt và trả về duy nhất khối JSON hợp lệ.`;
 
-    const geminiResult = await callGeminiWithFallback(ai, {
+    const outcome = await callGeminiWithFallback(ai, {
       contents: prompt + "\n\nJSON DỮ LIỆU CẦN DỊCH:\n" + JSON.stringify(analysis),
       config: {
         responseMimeType: "application/json",
@@ -715,9 +1161,9 @@ CÁC NGUYÊN TẮC BẮT BUỘC:
     });
 
     let translatedJson: any = null;
-    if (geminiResult?.text) {
+    if (outcome.text) {
       try {
-        translatedJson = JSON.parse(geminiResult.text);
+        translatedJson = parseJsonSafely(outcome.text);
       } catch (parseErr) {
         console.warn("Translation analysis JSON parse error:", parseErr);
       }
@@ -749,9 +1195,22 @@ CÁC NGUYÊN TẮC BẮT BUỘC:
   }
 });
 
+// Health check and route verification for /api/translate (prevents 404 on GET)
+app.get(translateRoutes, (req, res) => {
+  const ai = getAiClient();
+  res.json({
+    status: "online",
+    endpoint: "/api/translate",
+    methods: ["POST"],
+    description: "SEOUL STEP Contextual Translation API",
+    aiConfigured: !!ai,
+  });
+});
+
 // AI Endpoint: High-precision contextual translation across Vietnamese, Korean, and English
-app.post("/api/translate", async (req, res) => {
+app.post(translateRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const {
       text,
       direction = "auto",
@@ -870,16 +1329,14 @@ YÊU CẦU DỊCH THUẬT:
 Hãy dịch trọn vẹn, chính xác ngữ nghĩa và hoàn hảo về ngữ cảnh, sau đó trả về duy nhất khối JSON theo schema đã quy định.`;
 
     if (!ai) {
-      const fallbackResult = generateOfflineTranslation(
-        trimmedText,
-        effectiveSource,
-        effectiveTarget,
-        context,
-        style,
-        level,
-        uiLanguage
-      );
-      res.json(fallbackResult);
+      res.status(503).json({
+        error:
+          uiLanguage === "ko"
+            ? "Gemini API 키가 서버에 설정되지 않았습니다."
+            : uiLanguage === "en"
+            ? "Gemini API key is not configured on the server."
+            : "Chưa cấu hình GEMINI_API_KEY trên máy chủ.",
+      });
       return;
     }
 
@@ -983,7 +1440,7 @@ Hãy dịch trọn vẹn, chính xác ngữ nghĩa và hoàn hảo về ngữ c�
       ],
     };
 
-    const geminiResult = await callGeminiWithFallback(ai, {
+    const outcome = await callGeminiWithFallback(ai, {
       contents: systemPrompt + "\n\n" + userPrompt,
       config: {
         responseMimeType: "application/json",
@@ -992,25 +1449,26 @@ Hãy dịch trọn vẹn, chính xác ngữ nghĩa và hoàn hảo về ngữ c�
       },
     });
 
-    let translationData: any = null;
-    if (geminiResult?.text) {
-      try {
-        translationData = JSON.parse(geminiResult.text);
-      } catch (parseErr) {
-        console.warn("Translation parse error:", parseErr);
-      }
+    if (!outcome.text) {
+      const isTimeout = outcome.errorStatus === 504;
+      res.status(outcome.errorStatus || 503).json({
+        error:
+          uiLanguage === "ko"
+            ? (isTimeout ? "번역 요청 시간이 초과되었습니다. 다시 시도해 주세요." : "AI 번역 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요.")
+            : uiLanguage === "en"
+            ? (isTimeout ? "Translation request timed out. Please try again." : "Translation service is temporarily busy. Please try again.")
+            : (isTimeout ? "Yêu cầu dịch thuật AI quá thời gian phản hồi. Vui lòng thử lại sau." : "Dịch vụ dịch thuật AI đang bận hoặc quá tải tạm thời. Vui lòng thử lại sau giây lát."),
+      });
+      return;
     }
 
-    if (!translationData) {
-      translationData = generateOfflineTranslation(
-        trimmedText,
-        effectiveSource,
-        effectiveTarget,
-        context,
-        style,
-        level,
-        uiLanguage
-      );
+    let translationData: any = null;
+    try {
+      translationData = parseJsonSafely(outcome.text);
+    } catch (parseErr) {
+      console.warn("Translation parse error:", parseErr);
+      res.status(500).json({ error: "Không thể xử lý định dạng bản dịch từ AI. Vui lòng thử lại." });
+      return;
     }
 
     const finalResult = {
@@ -1036,8 +1494,9 @@ Hãy dịch trọn vẹn, chính xác ngữ nghĩa và hoàn hảo về ngữ c�
 });
 
 // Endpoint: AI Translate Situational Variations to any language on-demand
-app.post("/api/translate-variations", async (req, res) => {
+app.post(translateVariationsRoutes, async (req, res) => {
   try {
+    const ai = getAiClient();
     const { variations, targetLanguage = "vi", targetLanguageName } = req.body;
     if (!variations || !Array.isArray(variations) || variations.length === 0) {
       res.status(400).json({ error: "Missing variations data" });
@@ -1110,7 +1569,7 @@ Trả về duy nhất định dạng JSON có thuộc tính "variations" là m�
       required: ["variations"],
     };
 
-    const geminiResult = await callGeminiWithFallback(ai, {
+    const outcome = await callGeminiWithFallback(ai, {
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -1119,9 +1578,9 @@ Trả về duy nhất định dạng JSON có thuộc tính "variations" là m�
       },
     });
 
-    if (geminiResult?.text) {
+    if (outcome.text) {
       try {
-        const parsed = JSON.parse(geminiResult.text);
+        const parsed = parseJsonSafely(outcome.text);
         if (parsed.variations && Array.isArray(parsed.variations)) {
           res.json({
             translatedVariations: parsed.variations,
@@ -1301,13 +1760,15 @@ function generateOfflineAnalysis(
   level: string,
   uiLanguage: string
 ) {
-  const isSpacingIssue = !text.includes(" ") && text.length > 5;
+  const safeText = String(text || "안녕하세요").trim();
+  const safeContext = String(context || "");
+  const isSpacingIssue = !safeText.includes(" ") && safeText.length > 5;
   const isSpoken = style === "spoken";
-  const firstWord = text.split(" ")[0] || text;
+  const firstWord = safeText.split(" ")[0] || safeText;
 
   let coreCase: any = "CASE_1_CORRECT";
   let verdict: any = "CORRECT";
-  let correctedText = text;
+  let correctedText = safeText;
   let summaryVi = "Câu hoàn toàn chuẩn xác, đúng ngữ pháp và phù hợp để sử dụng ngay.";
 
   if (isSpacingIssue) {
@@ -1323,8 +1784,12 @@ function generateOfflineAnalysis(
   } else if (!isSpoken && (text.endsWith("어요") || text.endsWith("아요") || text.endsWith("해요") || text.startsWith("저는"))) {
     coreCase = "CASE_3_CONTEXT_UNSUITABLE";
     verdict = "GRAMMAR_OK_CONTEXT_UNSUITABLE";
-    summaryVi = "Ngữ pháp câu hoàn toàn đúng, nhưng đang dùng đuôi câu giao tiếp thân mật (-아요/어요) hoặc xưng hô '저', chưa phù hợp với văn viết chuẩn (문어체 yêu cầu đuôi -ㄴ/는다 và xưng hô '나').";
-    correctedText = text.replace(/^저는\s*/, "나는 ").replace(/어요$|아요$|해요$/, "한다");
+    summaryVi = "Ngữ pháp câu hoàn toàn đúng, nhưng đang dùng đuôi câu giao tiếp thân mật (-아요/어요), chưa phù hợp với văn viết chuẩn (문어체 yêu cầu đuôi -ㄴ/는다 hoặc -았다/었다).";
+    if (text.endsWith("졌어요") || text.endsWith("었어요") || text.endsWith("았어요") || text.endsWith("했어요")) {
+      correctedText = text.replace(/어요$|아요$/, "다");
+    } else {
+      correctedText = text.replace(/해요$/, "한다").replace(/어요$|아요$/, "다");
+    }
   } else if (text.includes("먹다") || text.includes("먹었")) {
     if (context.includes("người lớn") || context.includes("thầy cô") || context.includes("bố mẹ") || context.includes("bà") || context.includes("ông") || context.includes("elder")) {
       coreCase = "CASE_2_HAS_ERRORS";
@@ -1334,8 +1799,12 @@ function generateOfflineAnalysis(
     }
   }
 
+  correctedText = sanitizeKoreanSentence(correctedText);
+
   const langIsEn = uiLanguage === "en";
   const langIsKo = uiLanguage === "ko";
+
+  const diffTokens = buildStrictConsistentDiffTokens(safeText, correctedText);
 
   return {
     id: "analysis-local-" + Date.now(),
@@ -1381,14 +1850,7 @@ function generateOfflineAnalysis(
     verdictSummary: langIsKo ? "문장 분석이 완료되었습니다." : langIsEn ? "Sentence analysis completed." : summaryVi,
     correctedText,
     translation: langIsKo ? "입력된 한국어 문장의 기본 의미입니다." : langIsEn ? `Meaning of sentence: "${text}"` : `Ý nghĩa: "${text}"`,
-    diffTokens: [
-      {
-        text: correctedText,
-        type: correctedText === text ? "normal" : "modified",
-        original: text !== correctedText ? text : undefined,
-        note: correctedText !== text ? "Điều chỉnh chuẩn mực" : undefined,
-      }
-    ],
+    diffTokens,
     explanations: {
       spelling: {
         hasIssues: isSpacingIssue,

@@ -128,34 +128,26 @@ export const CorrectedSentenceCard: React.FC<CorrectedSentenceCardProps> = ({
         </div>
 
         <div className="p-3.5 sm:p-5 rounded-xl bg-slate-50 border-2 border-slate-300 text-base sm:text-2xl font-bold text-slate-900 leading-relaxed font-sans shadow-2xs">
-          {result.diffTokens && result.diffTokens.length > 0 ? (
+          {result.diffTokens && result.diffTokens.some((t: DiffToken) => t.type !== 'removed') ? (
             <div className="flex flex-wrap items-center gap-1.5 leading-loose">
-              {result.diffTokens.map((token: DiffToken, idx: number) => {
-                if (token.type === 'modified' || token.type === 'added') {
-                  const noteContent = token.note || (token.original ? `${t.replaceOriginalPrefix} "${token.original}"` : t.addParticleNote);
-                  return (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => setActiveTokenNote({ text: token.text, note: noteContent, original: token.original })}
-                      className="px-2.5 py-0.5 rounded-lg bg-emerald-100 text-emerald-950 border border-emerald-300 font-black underline decoration-emerald-500 decoration-2 transition-all cursor-pointer shadow-2xs active:scale-95 text-left inline-flex"
-                    >
-                      {token.text}
-                    </button>
-                  );
-                }
-                if (token.type === 'removed') {
-                  return (
-                    <span
-                      key={idx}
-                      className="px-1.5 py-0.5 rounded-md bg-rose-100 text-rose-800 line-through text-xs sm:text-sm opacity-80"
-                    >
-                      {token.text}
-                    </span>
-                  );
-                }
-                return <span key={idx}>{token.text}</span>;
-              })}
+              {result.diffTokens
+                .filter((token: DiffToken) => token.type !== 'removed')
+                .map((token: DiffToken, idx: number) => {
+                  if (token.type === 'modified' || token.type === 'added') {
+                    const noteContent = token.note || (token.original ? `${t.replaceOriginalPrefix} "${token.original}"` : t.addParticleNote);
+                    return (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => setActiveTokenNote({ text: token.text, note: noteContent, original: token.original })}
+                        className="px-2.5 py-0.5 rounded-lg bg-emerald-100 text-emerald-950 border border-emerald-300 font-black underline decoration-emerald-500 decoration-2 transition-all cursor-pointer shadow-2xs active:scale-95 text-left inline-flex"
+                      >
+                        {token.text}
+                      </button>
+                    );
+                  }
+                  return <span key={idx}>{token.text}</span>;
+                })}
             </div>
           ) : (
             <span>{result.correctedText || result.originalText}</span>

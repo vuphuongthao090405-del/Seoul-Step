@@ -202,7 +202,8 @@ export function playKoreanPronunciation(
   })
     .then(async (res) => {
       clearTimeout(timeoutId);
-      if (!res.ok || isCancelled || hasFallbackTriggered) {
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json') || isCancelled || hasFallbackTriggered) {
         throw new Error('TTS server error or fallback already active');
       }
       const data = await res.json();

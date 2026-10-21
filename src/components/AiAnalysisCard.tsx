@@ -12,6 +12,7 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Volume2,
+  AlertTriangle,
 } from "lucide-react";
 import { AnalysisResult, AppLanguage } from "../types";
 import { translations } from "../locales";
@@ -179,7 +180,8 @@ export const AiAnalysisCard: React.FC<AiAnalysisCardProps> = ({
         }),
       });
 
-      if (!response.ok) {
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.includes("application/json")) {
         throw new Error("API call failed");
       }
 
@@ -214,10 +216,17 @@ export const AiAnalysisCard: React.FC<AiAnalysisCardProps> = ({
               <h3 className="text-base sm:text-lg font-black text-slate-900 tracking-tight leading-snug">
                 {t.aiInsightsTitle}
               </h3>
-              <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs font-bold text-indigo-700 border border-indigo-200">
-                <Bot className="w-3.5 h-3.5" />
-                {analysis.aiEngine || "Gemini AI"}
-              </span>
+              {analysis.isAiPowered === false || analysis.isFallbackMode ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-bold text-amber-800 border border-amber-300">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                  {analysis.aiEngine || "Chế độ dự phòng"}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs font-bold text-indigo-700 border border-indigo-200">
+                  <Bot className="w-3.5 h-3.5" />
+                  {analysis.aiEngine || "Gemini AI"}
+                </span>
+              )}
             </div>
             <p className="text-xs text-slate-500 mt-0.5 font-medium">
               {uiLanguage === "ko"

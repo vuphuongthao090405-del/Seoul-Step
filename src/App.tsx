@@ -122,15 +122,77 @@ export default function App() {
         }),
       });
 
-      if (!res.ok) {
-        throw new Error(`Server status ${res.status}`);
+      // Safely parse JSON or text from the response body
+      const contentType = res.headers.get('content-type') || '';
+      let payload: any = null;
+      if (contentType.includes('application/json')) {
+        try {
+          payload = await res.json();
+        } catch (jsonErr) {
+          console.warn('JSON parse error from server:', jsonErr);
+        }
+      } else {
+        try {
+          const rawText = await res.text();
+          if (rawText.trim().startsWith('{')) {
+            payload = JSON.parse(rawText);
+          }
+        } catch {}
       }
 
-      const data: AnalysisResult = await res.json();
+      // Check if server returned an error (either with non-200 status or 200 containing error payload)
+      if (!res.ok || (payload && typeof payload === 'object' && payload.error)) {
+        const errorMsg =
+          payload?.error ||
+          payload?.message ||
+          (res.status === 429
+            ? (lang === 'vi'
+                ? 'Hạn mức API AI (429) hiện đang tạm thời vượt quá. Vui lòng chờ 1-2 phút rồi thử lại.'
+                : lang === 'ko'
+                ? 'AI API 할당량(429)이 일시적으로 초과되었습니다. 1~2분 후 다시 시도해 주세요.'
+                : 'AI quota limit exceeded (429). Please wait a moment and try again.')
+            : res.status === 503
+            ? (lang === 'vi'
+                ? 'Hệ thống AI đang chịu tải cao (503). Vui lòng thử lại sau vài giây.'
+                : lang === 'ko'
+                ? 'AI 서비스가 일시적으로 지연되고 있습니다 (503). 잠시 후 다시 시도해 주세요.'
+                : 'AI service is temporarily busy (503). Please try again in a moment.')
+            : res.status === 504
+            ? (lang === 'vi'
+                ? 'Yêu cầu AI quá thời gian phản hồi (504). Vui lòng thử lại sau giây lát.'
+                : lang === 'ko'
+                ? 'AI 요청 시간이 초과되었습니다 (504). 다시 시도해 주세요.'
+                : 'AI request timed out (504). Please try again.')
+            : (lang === 'vi'
+                ? `Máy chủ phản hồi trạng thái ${res.status}. Vui lòng thử lại sau giây lát.`
+                : lang === 'ko'
+                ? `서버 응답 오류 (${res.status}). 잠시 후 다시 시도해 주세요.`
+                : `Server returned error (${res.status}). Please try again.`));
+
+        setErrorMessage(errorMsg);
+        return;
+      }
+
+      // Validate that payload has the expected AnalysisResult structure
+      // Do NOT treat arbitrary HTTP 200 (like HTML or health check) as a valid result
+      if (!payload || typeof payload !== 'object' || !payload.originalText || (!payload.coreCase && !payload.verdict && !payload.correctedText)) {
+        setErrorMessage(
+          lang === 'vi'
+            ? 'Phản hồi từ máy chủ không chứa dữ liệu phân tích hợp lệ. Vui lòng thử lại.'
+            : lang === 'ko'
+            ? '서버에서 올바른 분석 데이터를 수신하지 못했습니다. 다시 시도해 주세요.'
+            : 'Invalid analysis data received from server. Please try again.'
+        );
+        return;
+      }
+
+      const data: AnalysisResult = payload;
       setCurrentResult(data);
 
-      // Add to history
-      setHistory((prev) => [data, ...prev.filter((item) => item.originalText !== data.originalText)].slice(0, 25));
+      // Add to history safely
+      if (data.originalText) {
+        setHistory((prev) => [data, ...prev.filter((item) => item?.originalText && item.originalText !== data.originalText)].slice(0, 25));
+      }
 
       // Smooth scroll to results on mobile/desktop
       setTimeout(() => {
@@ -140,13 +202,13 @@ export default function App() {
         }
       }, 100);
     } catch (err: any) {
-      console.error('Failed to analyze:', err);
+      console.error('Failed to analyze (network error):', err);
       setErrorMessage(
         lang === 'vi'
-          ? 'Không thể hoàn tất phân tích. Vui lòng kiểm tra kết nối mạng và thử lại.'
+          ? 'Không thể kết nối đến máy chủ. Vui lòng kiểm tra kết nối mạng và thử lại.'
           : lang === 'ko'
-          ? '문장 분석에 실패했습니다. 네트워크 연결을 확인한 후 다시 시도해 주세요.'
-          : 'Failed to complete analysis. Please check your connection and try again.'
+          ? '서버와 연결할 수 없습니다. 네트워크 연결을 확인한 후 다시 시도해 주세요.'
+          : 'Unable to connect to server. Please check your network connection and try again.'
       );
     } finally {
       setIsLoading(false);
@@ -171,7 +233,8 @@ export default function App() {
           }),
         });
 
-        if (res.ok) {
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
           const translated: AnalysisResult = await res.json();
           setCurrentResult(translated);
           setHistory((prev) =>

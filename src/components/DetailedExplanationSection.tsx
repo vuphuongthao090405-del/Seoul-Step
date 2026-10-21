@@ -74,6 +74,7 @@ export const DetailedExplanationSection: React.FC<DetailedExplanationSectionProp
 
   // Helper to determine status type
   const getSpellingStatus = (): DiagnosisStatus => {
+    if (coreCase === 'CASE_1_CORRECT' || coreCase === 'CASE_3_CONTEXT_UNSUITABLE') return 'good';
     if (explanations.spelling?.hasIssues || (explanations.spelling?.errorItems && explanations.spelling.errorItems.length > 0)) {
       return coreCase === 'CASE_2_HAS_ERRORS' ? 'error' : 'warning';
     }
@@ -81,6 +82,7 @@ export const DetailedExplanationSection: React.FC<DetailedExplanationSectionProp
   };
 
   const getGrammarStatus = (): DiagnosisStatus => {
+    if (coreCase === 'CASE_1_CORRECT' || coreCase === 'CASE_3_CONTEXT_UNSUITABLE') return 'good';
     if (explanations.grammar?.hasIssues || (explanations.grammar?.errorItems && explanations.grammar.errorItems.length > 0)) {
       return coreCase === 'CASE_2_HAS_ERRORS' ? 'error' : 'warning';
     }

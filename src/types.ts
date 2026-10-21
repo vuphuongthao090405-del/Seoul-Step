@@ -179,6 +179,8 @@ export interface AnalysisResult {
   selectedContext: string;
   isAiPowered?: boolean;
   aiEngine?: string;
+  isFallbackMode?: boolean;
+  fallbackReason?: string;
   aiInsights?: AiInsights;
   diffTokens: DiffToken[];
   explanations: {

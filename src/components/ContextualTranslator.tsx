@@ -332,7 +332,8 @@ export const ContextualTranslator: React.FC<ContextualTranslatorProps> = ({
         }),
       });
 
-      if (!res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
         throw new Error(`Server returned ${res.status}`);
       }
 
@@ -432,7 +433,8 @@ export const ContextualTranslator: React.FC<ContextualTranslatorProps> = ({
         }),
       });
 
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
         if (data.variations) {
           setTranslatedVariationsCache((prev) => ({
