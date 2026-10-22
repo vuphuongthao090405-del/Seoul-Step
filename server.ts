@@ -135,6 +135,7 @@ async function callGeminiWithFallback(
   const candidateList = candidates.length > 0
     ? candidates.slice(0, 2)
     : [PRIMARY_MODEL];
+  console.log("[Gemini] Candidate models:", candidateList);
 
   const startTime = Date.now();
   const TOTAL_BUDGET_MS = 25000;
