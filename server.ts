@@ -124,143 +124,212 @@ interface GeminiCallOutcome {
   errorMessage: string;
 }
 
+
 async function callGeminiWithFallback(
   aiClient: GoogleGenAI,
   params: GeminiCallParams
 ): Promise<GeminiCallOutcome> {
-  
-const allCandidates = [
-  ...new Set(params.candidateModels || DEFAULT_CANDIDATE_MODELS),
-].slice(0, 3);
+  const configuredModels =
+    params.candidateModels?.length
+      ? params.candidateModels
+      : DEFAULT_CANDIDATE_MODELS;
 
-// Prefer models not currently in cooldown.
-// If every model is cooling down, try the configured candidates anyway
-// rather than immediately returning an empty list.
-const availableCandidates = allCandidates.filter(isModelAvailable);
+  const allCandidates = [
+    ...new Set(configuredModels),
+  ].slice(0, 3);
 
-const candidateList =
-  availableCandidates.length > 0
-    ? availableCandidates
-    : allCandidates.length > 0
-      ? allCandidates
-      : [PRIMARY_MODEL];
+  // Prefer models that are not in cooldown.
+  // If all models are cooling down, try the configured list anyway.
+  const availableCandidates =
+    allCandidates.filter(isModelAvailable);
 
- 
-const startTime = Date.now();
+  const candidateList =
+    availableCandidates.length > 0
+      ? availableCandidates
+      : allCandidates.length > 0
+        ? allCandidates
+        : [PRIMARY_MODEL];
 
-// Keep the model fallback process short enough for serverless requests.
-const TOTAL_BUDGET_MS = 18000;
-const PER_MODEL_TIMEOUT_MS = Math.min(params.timeoutMs || 8000, 8000);
+  const startTime = Date.now();
+  const TOTAL_BUDGET_MS = 18000;
+  const PER_MODEL_TIMEOUT_MS = Math.min(
+    params.timeoutMs || 8000,
+    8000
+  );
 
-let lastStatus = 500;
-let lastError = "Unable to contact Gemini AI service";
+  let lastStatus = 500;
+  let lastError = "Unable to contact Gemini AI service";
 
-for (let modelIndex = 0; modelIndex < candidateList.length; modelIndex++) {
-  const modelName = candidateList[modelIndex];
-  const isPrimaryModel = modelIndex === 0;
+  console.log(
+    `[Gemini] Candidate models: ${candidateList.join(", ")}`
+  );
 
-  const elapsed = Date.now() - startTime;
-  const remainingTime = TOTAL_BUDGET_MS - elapsed;
+  for (
+    let modelIndex = 0;
+    modelIndex < candidateList.length;
+    modelIndex++
+  ) {
+    const modelName = candidateList[modelIndex];
+    const elapsed = Date.now() - startTime;
+    const remainingTime = TOTAL_BUDGET_MS - elapsed;
 
-  // Leave time for Express and Vercel to return the response.
-  if (remainingTime < 1500) {
-    console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
-    break;
-  }
+    // Leave time for the application to return its response.
+    if (remainingTime < 1500) {
+      console.warn(
+        `[Gemini] Time budget exhausted after ${elapsed}ms`
+      );
+      break;
+    }
 
-  const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`TIMEOUT_${modelName}`)),
-      currentTimeout
+    const currentTimeout = Math.min(
+      PER_MODEL_TIMEOUT_MS,
+      remainingTime
     );
-  });
 
-  const genPromise = aiClient.models.generateContent({
-    model: modelName,
-    contents: params.contents,
-    config: params.config,
-  });
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-  // Avoid an unhandled rejection if the timeout wins the race.
-  genPromise.catch(() => {});
+    console.log(
+      `[Gemini] Trying model ${modelIndex + 1}/${candidateList.length}: ${modelName}`
+    );
 
-  try {
-    const resp = await Promise.race([genPromise, timeoutPromise]);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`TIMEOUT_${modelName}`)),
+        currentTimeout
+      );
+    });
 
-    if (resp?.text) {
-      return {
-        text: resp.text,
-        modelName,
-        errorStatus: 200,
-        errorMessage: "",
-      };
+    const genPromise = aiClient.models.generateContent({
+      model: modelName,
+      contents: params.contents,
+      config: params.config,
+    });
+
+    // Prevent an unhandled rejection if the timeout wins.
+    genPromise.catch(() => {});
+
+    try {
+      const resp = await Promise.race([
+        genPromise,
+        timeoutPromise,
+      ]);
+
+      if (resp?.text) {
+        console.log(
+          `[Gemini] Success with ${modelName} in ${Date.now() - startTime}ms`
+        );
+
+        return {
+          text: resp.text,
+          modelName,
+          errorStatus: 200,
+          errorMessage: "",
+        };
+      }
+
+      lastStatus = 502;
+      lastError = `Empty response from ${modelName}`;
+
+      console.warn(`[Gemini] Empty response from ${modelName}`);
+    } catch (err: any) {
+      const errMsg = String(err?.message || "");
+      const normalized = errMsg.toLowerCase();
+
+      const status = Number(err?.status || err?.code || 0);
+
+      const isTimeout = errMsg.startsWith("TIMEOUT_");
+
+      const is404 =
+        status === 404 ||
+        normalized.includes("404") ||
+        normalized.includes("not found") ||
+        normalized.includes("is no longer available");
+
+      const is429 =
+        status === 429 ||
+        normalized.includes("429") ||
+        normalized.includes("quota") ||
+        normalized.includes("resource_exhausted");
+
+      const is503 =
+        status === 503 ||
+        normalized.includes("503") ||
+        normalized.includes("high demand") ||
+        normalized.includes("unavailable") ||
+        normalized.includes("overloaded");
+
+      // Normalize the status even if the SDK does not expose err.status.
+      lastStatus = isTimeout
+        ? 504
+        : is404
+          ? 404
+          : is429
+            ? 429
+            : is503
+              ? 503
+              : status >= 400 && status <= 599
+                ? status
+                : 500;
+
+      lastError = isTimeout
+        ? `Request to ${modelName} timed out after ${currentTimeout}ms`
+        : errMsg || `Request to ${modelName} failed`;
+
+      if (is404) {
+        markModelPermanentlyDisabled(
+          modelName,
+          errMsg.slice(0, 80)
+        );
+
+        console.warn(
+          `[Gemini] Model ${modelName} returned 404; disabled`
+        );
+      } else if (is429) {
+        markModelCooldown(modelName, 2 * 60 * 1000);
+
+        console.warn(
+          `[Gemini] 429/quota limit on ${modelName}; trying next model`
+        );
+      } else if (is503) {
+        markModelCooldown(modelName, 30 * 1000);
+
+        console.warn(
+          `[Gemini] 503 on ${modelName}; trying next model`
+        );
+      } else if (isTimeout) {
+        console.warn(
+          `[Gemini] Timeout on ${modelName} after ${currentTimeout}ms; trying next model`
+        );
+      } else {
+        console.warn(
+          `[Gemini] Error ${lastStatus} on ${modelName}: ${errMsg.slice(0, 150)}`
+        );
+      }
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
 
-    lastStatus = 502;
-    lastError = `Empty response from ${modelName}`;
-  } catch (err: any) {
-    const status = Number(err?.status || err?.code || 0);
-    const errMsg = String(err?.message || "");
-    const normalized = errMsg.toLowerCase();
-
-    const isTimeout = errMsg.startsWith("TIMEOUT_");
-    const is404 =
-      status === 404 ||
-      normalized.includes("404") ||
-      normalized.includes("is no longer available");
-    const is429 =
-      status === 429 ||
-      normalized.includes("429") ||
-      normalized.includes("quota") ||
-      normalized.includes("resource_exhausted");
-    const is503 =
-      status === 503 ||
-      normalized.includes("503") ||
-      normalized.includes("high demand") ||
-      normalized.includes("unavailable");
-
-    lastStatus = isTimeout ? 504 : status || 500;
-    lastError = isTimeout
-      ? `Request to ${modelName} timed out`
-      : errMsg || `Request to ${modelName} failed`;
-
-    if (is404) {
-      markModelPermanentlyDisabled(modelName, errMsg.slice(0, 80));
-    } else if (is429) {
-      markModelCooldown(modelName, 2 * 60 * 1000);
-      console.warn(`[Gemini] ${modelName} quota/rate limited; trying backup`);
-    } else if (is503) {
-      markModelCooldown(modelName, 30 * 1000);
-      console.warn(`[Gemini] 503 on ${modelName}; trying next model`);
-    } else if (isTimeout) {
-      console.warn(
-        `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; trying next model`
-      );
-    } else {
-      console.warn(
-        `[Gemini] Error [${status}] on ${modelName}: ${errMsg.slice(0, 100)}`
+    if (modelIndex < candidateList.length - 1) {
+      console.log(
+        `[Gemini] Moving to next candidate after ${modelName}`
       );
     }
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 
-  // Do not retry the same failed model; continue to the next candidate.
-  if (isPrimaryModel && lastStatus === 503) {
-    console.warn("[Gemini] Primary model unavailable; switching to backup");
-  }
+  console.error(
+    `[Gemini] All candidates failed. Last status: ${lastStatus}; error: ${lastError}`
+  );
+
+  return {
+    text: "",
+    modelName: "",
+    errorStatus: lastStatus,
+    errorMessage: lastError,
+  };
 }
 
-return {
-  text: "",
-  modelName: "",
-  errorStatus: lastStatus,
-  errorMessage: lastError,
-};
-}
 
 
 // Clean up any repeated/glitched phrases or duplicate words in Korean sentence
