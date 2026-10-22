@@ -216,12 +216,19 @@ async function callGeminiWithFallback(
           break; // Move to next candidate
         }
 
+       
         if (isTimeout) {
-          console.warn(`[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms`);
-          lastStatus = 504;
-          lastError = `Request to ${modelName} timed out`;
-          break; // Do not retry on timeout
-        }
+        console.warn(
+          `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; failing over`
+        );
+      
+        lastStatus = 504;
+        lastError = `Request to ${modelName} timed out`;
+      
+        // Stop trying this model and move to the next candidate.
+        break;
+      }
+
 
         if (is503) {
           console.warn(`[Gemini] 503 High Demand on ${modelName} (attempt ${attempt}/${maxAttempts})`);
