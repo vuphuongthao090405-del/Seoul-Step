@@ -79,9 +79,6 @@ const DEFAULT_CANDIDATE_MODELS = [
 // Permanently disabled / deprecated models (e.g. 404 models)
 const permanentlyDisabledModels = new Set<string>([
   "gemini-2.5-flash",
-  "gemini-2.0-flash",
-  "gemini-1.5-flash",
-  "gemini-1.5-pro",
   "gemini-3.5-flash",
   "gemini-3.5-flash-lite",
 ]);
@@ -127,18 +124,17 @@ interface GeminiCallOutcome {
   errorMessage: string;
 }
 
-// Resilient Gemini invoker: Primary model first, max 1 retry on 503, failover only to single backup, no 404 retries
 async function callGeminiWithFallback(
   aiClient: GoogleGenAI,
   params: GeminiCallParams
 ): Promise<GeminiCallOutcome> {
-  const candidateList = (params.candidateModels || DEFAULT_CANDIDATE_MODELS).filter(
-    (m) => isModelAvailable(m)
-  );
+  const candidates = (
+    params.candidateModels || DEFAULT_CANDIDATE_MODELS
+  ).filter((m) => isModelAvailable(m));
 
-  if (candidateList.length === 0) {
-    candidateList.push(PRIMARY_MODEL);
-  }
+  const candidateList = candidates.length > 0
+    ? candidates.slice(0, 2)
+    : [PRIMARY_MODEL];
 
   const startTime = Date.now();
   const TOTAL_BUDGET_MS = 25000;
@@ -147,27 +143,28 @@ async function callGeminiWithFallback(
   let lastStatus = 500;
   let lastError = "Unable to contact Gemini AI service";
 
-  for (const modelName of candidateList) {
-    const elapsed = Date.now() - startTime;
-    const remainingTime = TOTAL_BUDGET_MS - elapsed;
-    if (remainingTime < 2500) {
-      console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
-      break;
-    }
+  for (let modelIndex = 0; modelIndex < candidateList.length; modelIndex++) {
+    const modelName = candidateList[modelIndex];
+    const isPrimaryModel = modelIndex === 0;
+    let retry503 = 0;
 
-    const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
+    while (true) {
+      const elapsed = Date.now() - startTime;
+      const remainingTime = TOTAL_BUDGET_MS - elapsed;
 
-    // Max 1 retry for transient 503 errors on the primary model
-    const maxAttempts = 2;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (attempt > 1) {
-        // Controlled backoff delay on 503
-        await new Promise((r) => setTimeout(r, 1200));
+      if (remainingTime < 2500) {
+        console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
+        break;
       }
 
-      let timer: NodeJS.Timeout | null = null;
+      const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
       const timeoutPromise = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`TIMEOUT_${modelName}`)), currentTimeout);
+        timer = setTimeout(
+          () => reject(new Error(`TIMEOUT_${modelName}`)),
+          currentTimeout
+        );
       });
 
       const genPromise = aiClient.models.generateContent({
@@ -176,14 +173,13 @@ async function callGeminiWithFallback(
         config: params.config,
       });
 
-      // Attach catch handler to prevent unhandled rejection if timeout triggers first
+      // Prevent an unhandled rejection if the timeout wins the race.
       genPromise.catch(() => {});
 
       try {
         const resp = await Promise.race([genPromise, timeoutPromise]);
-        if (timer) clearTimeout(timer);
 
-        if (resp && resp.text) {
+        if (resp?.text) {
           return {
             text: resp.text,
             modelName,
@@ -191,68 +187,86 @@ async function callGeminiWithFallback(
             errorMessage: "",
           };
         }
-      } catch (err: any) {
-        if (timer) clearTimeout(timer);
 
+        lastStatus = 502;
+        lastError = `Empty response from ${modelName}`;
+        break;
+      } catch (err: any) {
         const status = Number(err?.status || err?.code || 0);
         const errMsg = String(err?.message || "");
-        lastStatus = status || 500;
-        lastError = errMsg;
+        const normalized = errMsg.toLowerCase();
 
         const isTimeout = errMsg.startsWith("TIMEOUT_");
-        const is404 = status === 404 || errMsg.includes("404") || errMsg.includes("is no longer available");
-        const isQuota429 = status === 429 || errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED");
-        const is503 = status === 503 || errMsg.includes("503") || errMsg.includes("high demand") || errMsg.includes("UNAVAILABLE");
+        const is404 =
+          status === 404 ||
+          normalized.includes("404") ||
+          normalized.includes("is no longer available");
+        const is429 =
+          status === 429 ||
+          normalized.includes("429") ||
+          normalized.includes("quota") ||
+          normalized.includes("resource_exhausted");
+        const is503 =
+          status === 503 ||
+          normalized.includes("503") ||
+          normalized.includes("high demand") ||
+          normalized.includes("unavailable");
+
+        lastStatus = isTimeout ? 504 : status || 500;
+        lastError = isTimeout
+          ? `Request to ${modelName} timed out`
+          : errMsg || `Request to ${modelName} failed`;
 
         if (is404) {
-          // Never retry a 404 model, permanently disable it
           markModelPermanentlyDisabled(modelName, errMsg.slice(0, 80));
-          break; // Immediately move to next candidate or stop
+          break;
         }
 
-        if (isQuota429) {
+        if (is429) {
           markModelCooldown(modelName, 2 * 60 * 1000);
-          console.warn(`[Gemini] Model ${modelName} hit quota (429), failing over`);
-          break; // Move to next candidate
+          console.warn(`[Gemini] ${modelName} quota/rate limited; trying backup`);
+          break;
         }
-
-       
-        if (isTimeout) {
-        console.warn(
-          `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; failing over`
-        );
-      
-        lastStatus = 504;
-        lastError = `Request to ${modelName} timed out`;
-      
-        // Stop trying this model and move to the next candidate.
-        break;
-      }
-
 
         if (is503) {
-          console.warn(`[Gemini] 503 High Demand on ${modelName} (attempt ${attempt}/${maxAttempts})`);
-          if (attempt >= maxAttempts) {
-            markModelCooldown(modelName, 30 * 1000);
-            break; // Fail over to backup model
+          if (isPrimaryModel && retry503 < 1) {
+            retry503++;
+            const delay = 1200;
+            const remaining = TOTAL_BUDGET_MS - (Date.now() - startTime);
+
+            if (remaining > delay + 2500) {
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              continue;
+            }
           }
-          continue; // Retry once
+
+          markModelCooldown(modelName, 30 * 1000);
+          console.warn(`[Gemini] 503 on ${modelName}; trying next model`);
+          break;
         }
 
-        console.warn(`[Gemini] Error [${status}] on ${modelName}:`, errMsg.slice(0, 100));
-        break; // Do not retry other errors
+        if (isTimeout) {
+          console.warn(
+            `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; trying next model`
+          );
+          break;
+        }
+
+        console.warn(`[Gemini] Error [${status}] on ${modelName}: ${errMsg.slice(0, 100)}`);
+        break;
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
   }
 
   return {
-    text: null,
+    text: "",
     modelName: "",
-    errorStatus: lastStatus || 503,
+    errorStatus: lastStatus,
     errorMessage: lastError,
   };
 }
-
 // Clean up any repeated/glitched phrases or duplicate words in Korean sentence
 export function sanitizeKoreanSentence(text: string): string {
   if (!text || typeof text !== "string") return "";
