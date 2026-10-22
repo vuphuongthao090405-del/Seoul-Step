@@ -145,137 +145,22 @@ const candidateList =
       ? allCandidates
       : [PRIMARY_MODEL];
 
-  const startTime = Date.now();
-  const TOTAL_BUDGET_MS = 25000;
-  const PER_MODEL_TIMEOUT_MS = params.timeoutMs || 12000;
+ 
+async function listAvailableModels() {
+  try {
+    const models = await aiClient.models.list();
 
-  let lastStatus = 500;
-  let lastError = "Unable to contact Gemini AI service";
-
-  for (let modelIndex = 0; modelIndex < candidateList.length; modelIndex++) {
-    const modelName = candidateList[modelIndex];
-    const isPrimaryModel = modelIndex === 0;
-    let retry503 = 0;
-
-    while (true) {
-      const elapsed = Date.now() - startTime;
-      const remainingTime = TOTAL_BUDGET_MS - elapsed;
-
-      if (remainingTime < 2500) {
-        console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
-        break;
-      }
-
-      const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
-      let timer: ReturnType<typeof setTimeout> | undefined;
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`TIMEOUT_${modelName}`)),
-          currentTimeout
-        );
+    for await (const model of models) {
+      console.log({
+        name: model.name,
+        supportedActions: model.supportedActions,
       });
-
-      const genPromise = aiClient.models.generateContent({
-        model: modelName,
-        contents: params.contents,
-        config: params.config,
-      });
-
-      // Prevent an unhandled rejection if the timeout wins the race.
-      genPromise.catch(() => {});
-
-      try {
-        const resp = await Promise.race([genPromise, timeoutPromise]);
-
-        if (resp?.text) {
-          return {
-            text: resp.text,
-            modelName,
-            errorStatus: 200,
-            errorMessage: "",
-          };
-        }
-
-        lastStatus = 502;
-        lastError = `Empty response from ${modelName}`;
-        break;
-      } catch (err: any) {
-        const status = Number(err?.status || err?.code || 0);
-        const errMsg = String(err?.message || "");
-        const normalized = errMsg.toLowerCase();
-
-        const isTimeout = errMsg.startsWith("TIMEOUT_");
-        const is404 =
-          status === 404 ||
-          normalized.includes("404") ||
-          normalized.includes("is no longer available");
-        const is429 =
-          status === 429 ||
-          normalized.includes("429") ||
-          normalized.includes("quota") ||
-          normalized.includes("resource_exhausted");
-        const is503 =
-          status === 503 ||
-          normalized.includes("503") ||
-          normalized.includes("high demand") ||
-          normalized.includes("unavailable");
-
-        lastStatus = isTimeout ? 504 : status || 500;
-        lastError = isTimeout
-          ? `Request to ${modelName} timed out`
-          : errMsg || `Request to ${modelName} failed`;
-
-        if (is404) {
-          markModelPermanentlyDisabled(modelName, errMsg.slice(0, 80));
-          break;
-        }
-
-        if (is429) {
-          markModelCooldown(modelName, 2 * 60 * 1000);
-          console.warn(`[Gemini] ${modelName} quota/rate limited; trying backup`);
-          break;
-        }
-
-        if (is503) {
-          if (isPrimaryModel && retry503 < 1) {
-            retry503++;
-            const delay = 1200;
-            const remaining = TOTAL_BUDGET_MS - (Date.now() - startTime);
-
-            if (remaining > delay + 2500) {
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              continue;
-            }
-          }
-
-          markModelCooldown(modelName, 30 * 1000);
-          console.warn(`[Gemini] 503 on ${modelName}; trying next model`);
-          break;
-        }
-
-        if (isTimeout) {
-          console.warn(
-            `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; trying next model`
-          );
-          break;
-        }
-
-        console.warn(`[Gemini] Error [${status}] on ${modelName}: ${errMsg.slice(0, 100)}`);
-        break;
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
     }
+  } catch (error) {
+    console.error("[Gemini] Cannot list models:", error);
   }
-
-  return {
-    text: "",
-    modelName: "",
-    errorStatus: lastStatus,
-    errorMessage: lastError,
-  };
 }
+
 // Clean up any repeated/glitched phrases or duplicate words in Korean sentence
 export function sanitizeKoreanSentence(text: string): string {
   if (!text || typeof text !== "string") return "";
