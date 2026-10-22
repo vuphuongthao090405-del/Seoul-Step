@@ -146,20 +146,122 @@ const candidateList =
       : [PRIMARY_MODEL];
 
  
-async function listAvailableModels() {
-  try {
-    const models = await aiClient.models.list();
+const startTime = Date.now();
 
-    for await (const model of models) {
-      console.log({
-        name: model.name,
-        supportedActions: model.supportedActions,
-      });
+// Keep the model fallback process short enough for serverless requests.
+const TOTAL_BUDGET_MS = 18000;
+const PER_MODEL_TIMEOUT_MS = Math.min(params.timeoutMs || 8000, 8000);
+
+let lastStatus = 500;
+let lastError = "Unable to contact Gemini AI service";
+
+for (let modelIndex = 0; modelIndex < candidateList.length; modelIndex++) {
+  const modelName = candidateList[modelIndex];
+  const isPrimaryModel = modelIndex === 0;
+
+  const elapsed = Date.now() - startTime;
+  const remainingTime = TOTAL_BUDGET_MS - elapsed;
+
+  // Leave time for Express and Vercel to return the response.
+  if (remainingTime < 1500) {
+    console.warn(`[Gemini] Time budget exhausted (${elapsed}ms elapsed)`);
+    break;
+  }
+
+  const currentTimeout = Math.min(PER_MODEL_TIMEOUT_MS, remainingTime);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`TIMEOUT_${modelName}`)),
+      currentTimeout
+    );
+  });
+
+  const genPromise = aiClient.models.generateContent({
+    model: modelName,
+    contents: params.contents,
+    config: params.config,
+  });
+
+  // Avoid an unhandled rejection if the timeout wins the race.
+  genPromise.catch(() => {});
+
+  try {
+    const resp = await Promise.race([genPromise, timeoutPromise]);
+
+    if (resp?.text) {
+      return {
+        text: resp.text,
+        modelName,
+        errorStatus: 200,
+        errorMessage: "",
+      };
     }
-  } catch (error) {
-    console.error("[Gemini] Cannot list models:", error);
+
+    lastStatus = 502;
+    lastError = `Empty response from ${modelName}`;
+  } catch (err: any) {
+    const status = Number(err?.status || err?.code || 0);
+    const errMsg = String(err?.message || "");
+    const normalized = errMsg.toLowerCase();
+
+    const isTimeout = errMsg.startsWith("TIMEOUT_");
+    const is404 =
+      status === 404 ||
+      normalized.includes("404") ||
+      normalized.includes("is no longer available");
+    const is429 =
+      status === 429 ||
+      normalized.includes("429") ||
+      normalized.includes("quota") ||
+      normalized.includes("resource_exhausted");
+    const is503 =
+      status === 503 ||
+      normalized.includes("503") ||
+      normalized.includes("high demand") ||
+      normalized.includes("unavailable");
+
+    lastStatus = isTimeout ? 504 : status || 500;
+    lastError = isTimeout
+      ? `Request to ${modelName} timed out`
+      : errMsg || `Request to ${modelName} failed`;
+
+    if (is404) {
+      markModelPermanentlyDisabled(modelName, errMsg.slice(0, 80));
+    } else if (is429) {
+      markModelCooldown(modelName, 2 * 60 * 1000);
+      console.warn(`[Gemini] ${modelName} quota/rate limited; trying backup`);
+    } else if (is503) {
+      markModelCooldown(modelName, 30 * 1000);
+      console.warn(`[Gemini] 503 on ${modelName}; trying next model`);
+    } else if (isTimeout) {
+      console.warn(
+        `[Gemini] Timeout calling ${modelName} after ${currentTimeout}ms; trying next model`
+      );
+    } else {
+      console.warn(
+        `[Gemini] Error [${status}] on ${modelName}: ${errMsg.slice(0, 100)}`
+      );
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  // Do not retry the same failed model; continue to the next candidate.
+  if (isPrimaryModel && lastStatus === 503) {
+    console.warn("[Gemini] Primary model unavailable; switching to backup");
   }
 }
+
+return {
+  text: "",
+  modelName: "",
+  errorStatus: lastStatus,
+  errorMessage: lastError,
+};
+
+
 
 // Clean up any repeated/glitched phrases or duplicate words in Korean sentence
 export function sanitizeKoreanSentence(text: string): string {
