@@ -260,7 +260,7 @@ return {
   errorStatus: lastStatus,
   errorMessage: lastError,
 };
-
+}
 
 
 // Clean up any repeated/glitched phrases or duplicate words in Korean sentence
