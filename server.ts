@@ -66,8 +66,8 @@ interface GeminiCallParams {
 }
 
 // Primary stable models for fast, structured linguistic tasks, with ordered failover
-const PRIMARY_MODEL = "gemini-flash-lite-latest";
-const SECONDARY_MODEL = "gemini-3.1-flash-lite";
+const PRIMARY_MODEL = "gemini-3.1-flash-lite";
+const SECONDARY_MODEL = "gemini-flash-lite-latest";
 const BACKUP_MODEL = "gemini-flash-latest";
 
 const DEFAULT_CANDIDATE_MODELS = [
@@ -151,10 +151,10 @@ async function callGeminiWithFallback(
         : [PRIMARY_MODEL];
 
   const startTime = Date.now();
-  const TOTAL_BUDGET_MS = 18000;
+  const TOTAL_BUDGET_MS = 25000;
   const PER_MODEL_TIMEOUT_MS = Math.min(
-    params.timeoutMs || 8000,
-    8000
+    params.timeoutMs || 10000,
+    10000
   );
 
   let lastStatus = 500;
