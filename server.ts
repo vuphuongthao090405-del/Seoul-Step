@@ -128,14 +128,22 @@ async function callGeminiWithFallback(
   aiClient: GoogleGenAI,
   params: GeminiCallParams
 ): Promise<GeminiCallOutcome> {
-  const candidates = (
-    params.candidateModels || DEFAULT_CANDIDATE_MODELS
-  ).filter((m) => isModelAvailable(m));
+  
+const allCandidates = [
+  ...new Set(params.candidateModels || DEFAULT_CANDIDATE_MODELS),
+].slice(0, 2);
 
-  const candidateList = candidates.length > 0
-    ? candidates.slice(0, 2)
-    : [PRIMARY_MODEL];
-  console.log("[Gemini] Candidate models:", candidateList);
+// Prefer models not currently in cooldown.
+// If every model is cooling down, try the configured candidates anyway
+// rather than immediately returning an empty list.
+const availableCandidates = allCandidates.filter(isModelAvailable);
+
+const candidateList =
+  availableCandidates.length > 0
+    ? availableCandidates
+    : allCandidates.length > 0
+      ? allCandidates
+      : [PRIMARY_MODEL];
 
   const startTime = Date.now();
   const TOTAL_BUDGET_MS = 25000;
