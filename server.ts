@@ -150,7 +150,7 @@ async function callGeminiWithFallback(
         : [PRIMARY_MODEL];
 
   const startTime = Date.now();
-  const TOTAL_BUDGET_MS = 30000;
+  const TOTAL_BUDGET_MS = 25000;
   const PER_MODEL_TIMEOUT_MS = Math.min(
     params.timeoutMs || 10000,
     10000
