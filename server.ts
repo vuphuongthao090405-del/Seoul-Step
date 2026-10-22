@@ -131,7 +131,7 @@ async function callGeminiWithFallback(
   
 const allCandidates = [
   ...new Set(params.candidateModels || DEFAULT_CANDIDATE_MODELS),
-].slice(0, 2);
+].slice(0, 3);
 
 // Prefer models not currently in cooldown.
 // If every model is cooling down, try the configured candidates anyway
